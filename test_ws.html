@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html>
+  <body>
+    <h2>WebSocket Test</h2>
+    <pre id="log"></pre>
+
+    <script>
+      const log = document.getElementById("log");
+
+      const ws = new WebSocket("ws://localhost:5000/ws/calls?client_id=test_dashboard&clinic_id=1");
+
+      ws.onopen = () => {
+        log.textContent += "Connected\n";
+        ws.send("ping");
+      };
+
+      ws.onmessage = (event) => {
+        log.textContent += "Message: " + event.data + "\n";
+      };
+
+      ws.onclose = () => {
+        log.textContent += "Closed\n";
+      };
+
+      ws.onerror = (error) => {
+        log.textContent += "Error\n";
+        console.error(error);
+      };
+    </script>
+  </body>
+</html>
