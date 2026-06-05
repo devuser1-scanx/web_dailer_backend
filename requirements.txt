@@ -7,3 +7,4 @@ twilio
 python-multipart
 httpx
 pydantic
+uvicorn[standard]

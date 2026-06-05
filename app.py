@@ -12,6 +12,7 @@ from routes.websocket import router as websocket_router
 from routes.notifications import router as notifications_router
 from routes.dev import router as dev_router
 from routes.voice import router as voice_router
+from routes.dashboard import router as dashboard_router
 
 app = FastAPI(title=APP_NAME)
 
@@ -30,6 +31,7 @@ app.include_router(websocket_router)
 app.include_router(notifications_router)
 app.include_router(dev_router)
 app.include_router(voice_router)
+app.include_router(dashboard_router)
 
 
 @app.get("/")
