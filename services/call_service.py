@@ -2,8 +2,7 @@
 
 from sqlalchemy import text
 from database import SessionLocal
-from services.patient_service import find_patient_by_phone
-from utils.phone import normalize_phone, phone_search_pattern
+from utils.phone import normalize_phone
 
 
 MISSED_STATUSES = {"no-answer", "busy", "failed", "canceled", "cancelled"}
@@ -13,6 +12,10 @@ def create_companion_tables_if_not_exists():
     """
     Creates only new dialer-specific companion tables.
     Does NOT modify existing clinics, patients, call_logs, or appointment tables.
+
+    NOTE:
+    If you already created these manually in Cloud SQL, this function does not
+    need to be called on app startup.
     """
 
     sql = text("""
@@ -76,7 +79,12 @@ def create_call_log(
     staff_phone: str | None = None,
 ) -> int:
     """
-    Inserts into existing call_logs table.
+    Inserts one call into existing call_logs table.
+
+    Unknown numbers are allowed:
+    - appointment_id can be None
+    - patient_number still gets saved
+    - UI will show display_name as "Unknown Caller"
     """
 
     normalized_number = normalize_phone(patient_number)
@@ -209,12 +217,20 @@ def create_call_event(
         db.commit()
 
 
-def get_recent_calls(limit: int = 50) -> list[dict]:
+def get_recent_calls(limit: int = 20) -> list[dict]:
     """
     Recent calls with patient name if matched.
+
+    Important:
+    One row in call_logs = one row in UI.
+
+    Uses LEFT JOIN LATERAL to pick only ONE best appointment match per call:
+    1. Exact appointment_id match first.
+    2. Otherwise latest appointment with same phone.
+    3. If no match, patient fields stay null and UI shows Unknown Caller.
     """
 
-    sql = text("""
+    sql = text(f"""
         SELECT
             cl.id,
             cl.appointment_id,
@@ -226,6 +242,7 @@ def get_recent_calls(limit: int = 50) -> list[dict]:
             cl.duration,
             cl.created_at,
             cl.updated_at,
+
             a.first_name,
             a.last_name,
             CONCAT_WS(' ', a.first_name, a.last_name) AS patient_name,
@@ -235,12 +252,28 @@ def get_recent_calls(limit: int = 50) -> list[dict]:
             a.location,
             a.calendar,
             c.name AS clinic_name
+
         FROM call_logs cl
-        LEFT JOIN appointment a
-            ON a.appointment_id = cl.appointment_id
-            OR REPLACE(REPLACE(REPLACE(REPLACE(COALESCE(a.phone, ''), '+', ''), '-', ''), ' ', ''), '(', '')
-               ILIKE CONCAT('%', REPLACE(REPLACE(REPLACE(REPLACE(COALESCE(cl.patient_number, ''), '+', ''), '-', ''), ' ', ''), '(', ''), '%')
+
+        LEFT JOIN LATERAL (
+            SELECT ap.*
+            FROM appointment ap
+            WHERE
+                ap.appointment_id = cl.appointment_id
+                OR (
+                    cl.patient_number IS NOT NULL
+                    AND REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(COALESCE(ap.phone, ''), '+', ''), '-', ''), ' ', ''), '(', ''), ')', '')
+                        = REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(COALESCE(cl.patient_number, ''), '+', ''), '-', ''), ' ', ''), '(', ''), ')', '')
+                )
+            ORDER BY
+                CASE WHEN ap.appointment_id = cl.appointment_id THEN 0 ELSE 1 END,
+                COALESCE(ap.appointment_datetime, ap.date) DESC NULLS LAST,
+                ap.created_at DESC NULLS LAST
+            LIMIT 1
+        ) a ON TRUE
+
         LEFT JOIN clinics c ON c.id = a.clinic_id
+
         ORDER BY cl.created_at DESC
         LIMIT :limit
     """)
@@ -251,9 +284,11 @@ def get_recent_calls(limit: int = 50) -> list[dict]:
     return [_format_call_row(dict(row)) for row in rows]
 
 
-def get_missed_calls(limit: int = 50) -> list[dict]:
+def get_missed_calls(limit: int = 20) -> list[dict]:
     """
     Missed calls with patient name if known, otherwise Unknown Caller.
+
+    One call_logs row appears once only.
     """
 
     sql = text("""
@@ -268,6 +303,7 @@ def get_missed_calls(limit: int = 50) -> list[dict]:
             cl.duration,
             cl.created_at,
             cl.updated_at,
+
             a.first_name,
             a.last_name,
             CONCAT_WS(' ', a.first_name, a.last_name) AS patient_name,
@@ -277,13 +313,36 @@ def get_missed_calls(limit: int = 50) -> list[dict]:
             a.location,
             a.calendar,
             c.name AS clinic_name
+
         FROM call_logs cl
-        LEFT JOIN appointment a
-            ON a.appointment_id = cl.appointment_id
-            OR REPLACE(REPLACE(REPLACE(REPLACE(COALESCE(a.phone, ''), '+', ''), '-', ''), ' ', ''), '(', '')
-               ILIKE CONCAT('%', REPLACE(REPLACE(REPLACE(REPLACE(COALESCE(cl.patient_number, ''), '+', ''), '-', ''), ' ', ''), '(', ''), '%')
+
+        LEFT JOIN LATERAL (
+            SELECT ap.*
+            FROM appointment ap
+            WHERE
+                ap.appointment_id = cl.appointment_id
+                OR (
+                    cl.patient_number IS NOT NULL
+                    AND REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(COALESCE(ap.phone, ''), '+', ''), '-', ''), ' ', ''), '(', ''), ')', '')
+                        = REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(COALESCE(cl.patient_number, ''), '+', ''), '-', ''), ' ', ''), '(', ''), ')', '')
+                )
+            ORDER BY
+                CASE WHEN ap.appointment_id = cl.appointment_id THEN 0 ELSE 1 END,
+                COALESCE(ap.appointment_datetime, ap.date) DESC NULLS LAST,
+                ap.created_at DESC NULLS LAST
+            LIMIT 1
+        ) a ON TRUE
+
         LEFT JOIN clinics c ON c.id = a.clinic_id
-        WHERE LOWER(COALESCE(cl.status, '')) IN ('no-answer', 'busy', 'failed', 'canceled', 'cancelled')
+
+        WHERE LOWER(COALESCE(cl.status, '')) IN (
+            'no-answer',
+            'busy',
+            'failed',
+            'canceled',
+            'cancelled'
+        )
+
         ORDER BY cl.created_at DESC
         LIMIT :limit
     """)
@@ -295,6 +354,12 @@ def get_missed_calls(limit: int = 50) -> list[dict]:
 
 
 def get_call_by_id(call_id: int) -> dict | None:
+    """
+    Get one call detail.
+
+    Uses lateral appointment matching so one call does not duplicate.
+    """
+
     sql = text("""
         SELECT
             cl.id,
@@ -307,6 +372,7 @@ def get_call_by_id(call_id: int) -> dict | None:
             cl.duration,
             cl.created_at,
             cl.updated_at,
+
             a.first_name,
             a.last_name,
             CONCAT_WS(' ', a.first_name, a.last_name) AS patient_name,
@@ -316,12 +382,28 @@ def get_call_by_id(call_id: int) -> dict | None:
             a.location,
             a.calendar,
             c.name AS clinic_name
+
         FROM call_logs cl
-        LEFT JOIN appointment a
-            ON a.appointment_id = cl.appointment_id
-            OR REPLACE(REPLACE(REPLACE(REPLACE(COALESCE(a.phone, ''), '+', ''), '-', ''), ' ', ''), '(', '')
-               ILIKE CONCAT('%', REPLACE(REPLACE(REPLACE(REPLACE(COALESCE(cl.patient_number, ''), '+', ''), '-', ''), ' ', ''), '(', ''), '%')
+
+        LEFT JOIN LATERAL (
+            SELECT ap.*
+            FROM appointment ap
+            WHERE
+                ap.appointment_id = cl.appointment_id
+                OR (
+                    cl.patient_number IS NOT NULL
+                    AND REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(COALESCE(ap.phone, ''), '+', ''), '-', ''), ' ', ''), '(', ''), ')', '')
+                        = REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(COALESCE(cl.patient_number, ''), '+', ''), '-', ''), ' ', ''), '(', ''), ')', '')
+                )
+            ORDER BY
+                CASE WHEN ap.appointment_id = cl.appointment_id THEN 0 ELSE 1 END,
+                COALESCE(ap.appointment_datetime, ap.date) DESC NULLS LAST,
+                ap.created_at DESC NULLS LAST
+            LIMIT 1
+        ) a ON TRUE
+
         LEFT JOIN clinics c ON c.id = a.clinic_id
+
         WHERE cl.id = :call_id
         LIMIT 1
     """)

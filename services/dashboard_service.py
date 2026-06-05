@@ -14,15 +14,22 @@ def get_dashboard_summary(
     """
     Returns business-friendly dashboard summary.
 
-    If no date range is provided, it uses today's date.
-    If start_date and end_date are provided, it filters between both dates.
+    Rules:
+    - If no date range is provided, it uses today's date.
+    - If only start_date is provided, it uses that as a single day.
+    - If start_date and end_date are provided, it filters between both dates.
+    - One row in call_logs appears as one row in UI.
+    - Patient details are attached using best appointment match only.
     """
 
     date_filter_sql = """
         DATE(cl.created_at) BETWEEN
         COALESCE(CAST(:start_date AS DATE), CURRENT_DATE)
         AND
-        COALESCE(CAST(:end_date AS DATE), COALESCE(CAST(:start_date AS DATE), CURRENT_DATE))
+        COALESCE(
+            CAST(:end_date AS DATE),
+            COALESCE(CAST(:start_date AS DATE), CURRENT_DATE)
+        )
     """
 
     summary_sql = text(f"""
@@ -38,7 +45,13 @@ def get_dashboard_summary(
             ) AS incoming_calls,
 
             COUNT(*) FILTER (
-                WHERE LOWER(COALESCE(cl.status, '')) IN ('no-answer', 'busy', 'failed', 'canceled', 'cancelled')
+                WHERE LOWER(COALESCE(cl.status, '')) IN (
+                    'no-answer',
+                    'busy',
+                    'failed',
+                    'canceled',
+                    'cancelled'
+                )
             ) AS missed_calls,
 
             COUNT(*) FILTER (
@@ -53,7 +66,8 @@ def get_dashboard_summary(
                 WHERE LOWER(COALESCE(cl.status, '')) = 'no-answer'
             ) AS no_answer_calls,
 
-            COALESCE(ROUND(AVG(NULLIF(cl.duration, 0))), 0) AS average_duration_seconds
+            COALESCE(ROUND(AVG(NULLIF(cl.duration, 0))), 0)
+                AS average_duration_seconds
 
         FROM call_logs cl
         WHERE {date_filter_sql}
@@ -83,12 +97,48 @@ def get_dashboard_summary(
             c.name AS clinic_name
 
         FROM call_logs cl
-        LEFT JOIN appointment a
-            ON a.appointment_id = cl.appointment_id
-            OR REPLACE(REPLACE(REPLACE(REPLACE(COALESCE(a.phone, ''), '+', ''), '-', ''), ' ', ''), '(', '')
-               ILIKE CONCAT('%', REPLACE(REPLACE(REPLACE(REPLACE(COALESCE(cl.patient_number, ''), '+', ''), '-', ''), ' ', ''), '(', ''), '%')
+
+        LEFT JOIN LATERAL (
+            SELECT ap.*
+            FROM appointment ap
+            WHERE
+                ap.appointment_id = cl.appointment_id
+                OR (
+                    cl.patient_number IS NOT NULL
+                    AND REPLACE(
+                        REPLACE(
+                            REPLACE(
+                                REPLACE(
+                                    REPLACE(COALESCE(ap.phone, ''), '+', ''),
+                                '-', ''),
+                            ' ', ''),
+                        '(', ''),
+                    ')', '')
+                    =
+                    REPLACE(
+                        REPLACE(
+                            REPLACE(
+                                REPLACE(
+                                    REPLACE(COALESCE(cl.patient_number, ''), '+', ''),
+                                '-', ''),
+                            ' ', ''),
+                        '(', ''),
+                    ')', '')
+                )
+            ORDER BY
+                CASE
+                    WHEN ap.appointment_id = cl.appointment_id THEN 0
+                    ELSE 1
+                END,
+                COALESCE(ap.appointment_datetime, ap.date) DESC NULLS LAST,
+                ap.created_at DESC NULLS LAST
+            LIMIT 1
+        ) a ON TRUE
+
         LEFT JOIN clinics c ON c.id = a.clinic_id
+
         WHERE {date_filter_sql}
+
         ORDER BY cl.created_at DESC
         LIMIT 10
     """)
@@ -117,13 +167,55 @@ def get_dashboard_summary(
             c.name AS clinic_name
 
         FROM call_logs cl
-        LEFT JOIN appointment a
-            ON a.appointment_id = cl.appointment_id
-            OR REPLACE(REPLACE(REPLACE(REPLACE(COALESCE(a.phone, ''), '+', ''), '-', ''), ' ', ''), '(', '')
-               ILIKE CONCAT('%', REPLACE(REPLACE(REPLACE(REPLACE(COALESCE(cl.patient_number, ''), '+', ''), '-', ''), ' ', ''), '(', ''), '%')
+
+        LEFT JOIN LATERAL (
+            SELECT ap.*
+            FROM appointment ap
+            WHERE
+                ap.appointment_id = cl.appointment_id
+                OR (
+                    cl.patient_number IS NOT NULL
+                    AND REPLACE(
+                        REPLACE(
+                            REPLACE(
+                                REPLACE(
+                                    REPLACE(COALESCE(ap.phone, ''), '+', ''),
+                                '-', ''),
+                            ' ', ''),
+                        '(', ''),
+                    ')', '')
+                    =
+                    REPLACE(
+                        REPLACE(
+                            REPLACE(
+                                REPLACE(
+                                    REPLACE(COALESCE(cl.patient_number, ''), '+', ''),
+                                '-', ''),
+                            ' ', ''),
+                        '(', ''),
+                    ')', '')
+                )
+            ORDER BY
+                CASE
+                    WHEN ap.appointment_id = cl.appointment_id THEN 0
+                    ELSE 1
+                END,
+                COALESCE(ap.appointment_datetime, ap.date) DESC NULLS LAST,
+                ap.created_at DESC NULLS LAST
+            LIMIT 1
+        ) a ON TRUE
+
         LEFT JOIN clinics c ON c.id = a.clinic_id
+
         WHERE {date_filter_sql}
-          AND LOWER(COALESCE(cl.status, '')) IN ('no-answer', 'busy', 'failed', 'canceled', 'cancelled')
+          AND LOWER(COALESCE(cl.status, '')) IN (
+              'no-answer',
+              'busy',
+              'failed',
+              'canceled',
+              'cancelled'
+          )
+
         ORDER BY cl.created_at DESC
         LIMIT 10
     """)
@@ -148,11 +240,17 @@ def get_dashboard_summary(
         "incoming_calls": int(summary_dict.get("incoming_calls") or 0),
         "missed_calls": int(summary_dict.get("missed_calls") or 0),
         "completed_calls": int(summary_dict.get("completed_calls") or 0),
-        "failed_or_busy_calls": int(summary_dict.get("failed_or_busy_calls") or 0),
+        "failed_or_busy_calls": int(
+            summary_dict.get("failed_or_busy_calls") or 0
+        ),
         "no_answer_calls": int(summary_dict.get("no_answer_calls") or 0),
-        "average_duration_seconds": int(summary_dict.get("average_duration_seconds") or 0),
+        "average_duration_seconds": int(
+            summary_dict.get("average_duration_seconds") or 0
+        ),
         "recent_calls": [_format_call_row(dict(row)) for row in recent_calls],
-        "missed_calls_list": [_format_call_row(dict(row)) for row in missed_calls],
+        "missed_calls_list": [
+            _format_call_row(dict(row)) for row in missed_calls
+        ],
     }
 
 
